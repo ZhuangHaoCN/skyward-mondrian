@@ -203,3 +203,155 @@
                  self.wakeful.add(dev.as_raw_fd())?;
                  self.panel = Some(Panel::new(path, dev)?);
                  for w in &self.touch_writes {
+--- a/crates/skyward-sys/src/lib.rs
++++ b/crates/skyward-sys/src/lib.rs
+@@ -185,11 +185,20 @@
+ /// Where the recovery service keeps the lines it writes to the kernel log
+ /// for as long as the phone stays in recovery.
+ pub const LOG: &str = "/skyward/run/recovery.log";
++/// A second copy of every line [`kmsg`] writes, on a partition that
++/// outlives the boot: /persist is mounted by the recovery before the log is
++/// kept, and is still there after the phone is started again. A run that
++/// ends badly leaves what it said here.
++pub const DURABLE_LOG: &str = "/persist/skyward-recovery.log";
+ 
+ /// The file [`kmsg`] writes its lines to as well, once [`keep_log`] opened
+ /// it.
+ static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
+ 
++/// The second file [`kmsg`] writes its lines to, on the partition that
++/// outlives the boot, once [`keep_durable_log`] opened it.
++static DURABLE: OnceLock<Mutex<File>> = OnceLock::new();
++
+ /// Whether the file [`keep_log`] opened was there already, an earlier run
+ /// of the recovery service having kept its log in it.
+ static RUNS_AGAIN: OnceLock<bool> = OnceLock::new();
+@@ -203,6 +212,36 @@
+     RUNS_AGAIN.set(again).map_err(|_| anyhow!("the log is kept in a file already"))
+ }
+ 
++/// Keep every line [`kmsg`] writes from now on in the file on the
++/// partition that outlives the boot as well, begun afresh each run so that
++/// what a run said is what the file holds. Failing to open it is not an
++/// error: a phone whose persist is not there yet still runs.
++pub fn keep_durable_log() {
++    if DURABLE.get().is_some() {
++        return;
++    }
++    // Appended to, never cut: a run that ends before it could say why
++    // leaves what it did say at the end of the file, after every run
++    // before it. The file is capped where it is opened, oldest lines
++    // first, so that it cannot grow without end on a phone taken into the
++    // recovery many times.
++    const MOST: u64 = 1 << 20;
++    if let Ok(about) = std::fs::metadata(DURABLE_LOG) {
++        if about.len() > MOST {
++            let _ = std::fs::remove_file(DURABLE_LOG);
++        }
++    }
++    let opened = OpenOptions::new().create(true).append(true).open(DURABLE_LOG);
++    match opened {
++        Ok(file) => {
++            let _ = DURABLE.set(Mutex::new(file));
++        }
++        Err(e) => {
++            let _ = kmsg(&format!("no durable log: {e}"));
++        }
++    }
++}
++
+ /// Whether the recovery service runs again since the phone started, as the
+ /// log an earlier run of it kept tells. What that run set up in the phone's
+ /// drivers is as it left it, a touch controller at rest among it.
+@@ -227,13 +266,22 @@
+ /// file takes the text first and whole; the kernel takes each of its lines
+ /// as a record of its own, and a line longer than a record as several.
+ pub fn kmsg(text: &str) -> Result<()> {
++    let stamped = since_boot().map(|at| format!("[{:>12.6}] {text}", at.as_secs_f64()));
+     let kept = match KEPT.get() {
+         Some(kept) => {
+             let mut kept = kept.lock().expect("nothing panics while writing the log");
+-            since_boot().and_then(|at| writeln!(kept, "[{:>12.6}] {text}", at.as_secs_f64()).with_context(|| format!("write {LOG}")))
++            match &stamped {
++                Ok(line) => writeln!(kept, "{line}").with_context(|| format!("write {LOG}")),
++                Err(e) => Err(anyhow!("{e:#}")),
++            }
+         }
+         None => Ok(()),
+     };
++    if let (Some(durable), Ok(line)) = (DURABLE.get(), &stamped) {
++        let mut durable = durable.lock().expect("nothing panics while writing the log");
++        let _ = writeln!(durable, "{line}");
++        let _ = durable.flush();
++    }
+     let mut f = OpenOptions::new().write(true).open("/dev/kmsg")?;
+     for record in written(text) {
+         f.write_all(record.as_bytes())?;
+--- a/crates/skyward/src/main.rs
++++ b/crates/skyward/src/main.rs
+@@ -517,8 +517,52 @@
+ /// The programs that use the phone's keys come after them, as `found`
+ /// among the phone's partitions: where what the partitions say could not
+ /// be made out, the phone's devices are up before that is said.
++/// Say what the phone's table and the kernel say of the things a page
++/// reads, so that the values a page shows can be checked against them.
++#[cfg(target_os = "android")]
++fn inspect_phone() {
++    let _ = skyward_sys::kmsg("---- what the phone says of itself ----");
++    for at in ["/proc/cmdline", "/sys/devices/system/cpu/possible", "/sys/devices/system/cpu/present"] {
++        match std::fs::read_to_string(at) {
++            Ok(text) => {
++                let _ = skyward_sys::kmsg(&format!("{at} = {}", text.trim()));
++            }
++            Err(e) => {
++                let _ = skyward_sys::kmsg(&format!("{at} = <{e}>"));
++            }
++        }
++    }
++    for id in 0..16 {
++        let at = format!("/sys/devices/system/cpu/cpu{id}/cpufreq/cpuinfo_max_freq");
++        if let Ok(text) = std::fs::read_to_string(&at) {
++            let _ = skyward_sys::kmsg(&format!("cpu{id} cpuinfo_max_freq = {}", text.trim()));
++        }
++    }
++    match std::fs::read_to_string("/vendor/etc/fstab.qcom") {
++        Ok(text) => {
++            for line in text.lines() {
++                if line.contains("/data ") && !line.trim_start().starts_with('#') {
++                    let _ = skyward_sys::kmsg(&format!("fstab data: {line}"));
++                }
++            }
++        }
++        Err(e) => {
++            let _ = skyward_sys::kmsg(&format!("fstab.qcom = <{e}>"));
++        }
++    }
++    for at in ["/data/unencrypted", "/data/misc/vold/user_keys"] {
++        let _ = skyward_sys::kmsg(&format!("{at} exists = {}", Path::new(at).exists()));
++    }
++    let _ = skyward_sys::kmsg("---- end what the phone says ----");
++}
++
+ #[cfg(target_os = "android")]
+ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Found>) -> Result<()> {
++    // What the phone's own table says of the data partition, and what the
++    // kernel has to say of the processors, before anything is mounted or
++    // loaded: a page that says the wrong thing of either is told apart from
++    // one whose drivers did not come up by these lines alone.
++    inspect_phone();
+     let nodes = skyward_sys::ueventd::apply()?;
+     skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?;
+     let props = skyward_info::installed_props(slot)?;
+@@ -750,6 +794,12 @@
+         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
+         skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
++        // A copy on the partition that outlives the boot, so that what a run
++        // said can be read once the phone is started again. It goes down
++        // before anything else is done, so that a run that ends badly leaves
++        // its own start in it.
++        skyward_sys::keep_durable_log();
++        let _ = skyward_sys::kmsg("skyward: durable log opened");
+         // A recovery that ended with a function of its own in the port took
+         // the port with it; going through "none" takes that function off.
+         if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
