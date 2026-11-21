@@ -1,0 +1,205 @@
+--- a/crates/skyward-crypto/src/data.rs
++++ b/crates/skyward-crypto/src/data.rs
+@@ -61,6 +61,56 @@
+     pub checked: Option<Checked>,
+ }
+ 
++/// Whether the phone's own table says the data partition is encrypted
++/// whole. A phone whose table names no `metadata_encryption=` for it keeps
++/// the filesystem bare on the partition, as some vendor builds of this
++/// generation do, and it is mounted as it lies. This is asked of the
++/// table alone, so that nothing reads `/data/unencrypted` before the
++/// partition is mounted.
++pub fn encrypted_whole(entry: &Entry) -> bool {
++    entry.extra("metadata_encryption").is_some()
++}
++
++/// Whether the phone keeps its filesystem bare on the data partition, so
++/// that nothing of it has to be unwrapped before it reads. Asked of the
++/// table alone, before anything touches the partition or the key service.
++pub fn opens_bare() -> Result<bool> {
++    Ok(!encrypted_whole(&data_entry()?))
++}
++
++/// Mount a data partition that is bare on its own: no key unwrapped, no
++/// mapping made, the filesystem checked and mounted where it lies, and the
++/// owner's shared storage shown as on the phone. Nothing of it is closed,
++/// there being no user whose own key was never let in.
++pub fn open_bare() -> Result<Opening> {
++    let mounted = match mount::is_mount_point(Path::new(MOUNT))? {
++        true => None,
++        false => Some(open_bare_at_once()?),
++    };
++    show_owner_storage()?;
++    Ok(Opening { mounted, closed: Vec::new() })
++}
++
++/// Check and mount a bare data partition, and give how it was mounted.
++fn open_bare_at_once() -> Result<Opened> {
++    let bare = data_entry()?;
++    let device = skyward_block::fstab::device(&bare)?;
++    let checked = match bare.extras.iter().any(|e| e == "check") {
++        true => Some(skyward_block::fsck::check(Path::new(&device), &bare.filesystem)?),
++        false => None,
++    };
++    std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
++    mount::mount(Path::new(&device), Path::new(MOUNT), &bare.filesystem, &bare.options)?;
++    Ok(Opened { mapped: PathBuf::from(device), filesystem: bare.filesystem.clone(), checked })
++}
++
++/// The first table entry for the data partition, whatever the phone says
++/// of its encryption.
++fn data_entry() -> Result<Entry> {
++    let entries = skyward_block::fstab::read(MOUNT)?;
++    entries.into_iter().next().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))
++}
++
+ /// Open the phone's data partition: unwrap the key it is encrypted with,
+ /// give that to the storage hardware, check the filesystem where the
+ /// phone's table asks for it, and mount it writable, as the phone mounts
+@@ -68,6 +118,20 @@
+ /// until that user's key is let in as well. A partition that does not
+ /// mount leaves no device behind.
+ fn open(service: &KeyMint) -> Result<Opened> {
++    // A phone whose table says the partition is not encrypted whole keeps
++    // its filesystem bare there; there is no key to unwrap and no mapping
++    // to make, so it is checked and mounted where it lies.
++    let bare = data_entry()?;
++    if !encrypted_whole(&bare) {
++        let device = skyward_block::fstab::device(&bare)?;
++        let checked = match bare.extras.iter().any(|e| e == "check") {
++            true => Some(skyward_block::fsck::check(Path::new(&device), &bare.filesystem)?),
++            false => None,
++        };
++        std::fs::create_dir_all(MOUNT).with_context(|| format!("make {MOUNT}"))?;
++        mount::mount(Path::new(&device), Path::new(MOUNT), &bare.filesystem, &bare.options)?;
++        return Ok(Opened { mapped: PathBuf::from(device), filesystem: bare.filesystem.clone(), checked });
++    }
+     let (entries, mapped) = map(service)?;
+     let mounted = (|| -> Result<(Option<Checked>, String)> {
+         // A phone that names the partition once per filesystem it might
+@@ -168,10 +232,18 @@
+ /// sign in, and open the own files of every user who set no screen lock
+ /// and, behind the owner's, of those whose credential the phone made up.
+ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
++    // A phone that keeps the filesystem bare on the partition has no keys
++    // to let in and no user whose files are closed: once it is mounted,
++    // everything on it reads as it lies, as it does on the phone itself.
++    let bare = !encrypted_whole(&data_entry()?);
+     let mounted = match mount::is_mount_point(Path::new(MOUNT))? {
+         true => None,
+         false => Some(open(service)?),
+     };
++    if bare {
++        show_owner_storage()?;
++        return Ok(Opening { mounted, closed: Vec::new() });
++    }
+     open_shared(service)?;
+     let mut closed = Vec::new();
+     let mut owner = Note::default();
+--- a/crates/skyward/src/decrypt.rs
++++ b/crates/skyward/src/decrypt.rs
+@@ -34,7 +34,16 @@
+     pub fn start(job: Job) -> Result<Decryptor> {
+         let worker = Worker::start("decrypt", move |tell| {
+             tell.tell(match job {
+-                Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
++                // A phone that keeps its filesystem bare on the data
++                // partition needs no key at all: the partition is taken as
++                // it lies, before the key service is even reached, so that
++                // a build of the phone that starts none of it still opens
++                // what is there.
++                Job::Open => Ended::Opened(match data::opens_bare() {
++                    Ok(true) => data::open_bare().map_err(|e| format!("{e:#}")),
++                    Ok(false) => with_key_service(data::open_without_credential),
++                    Err(e) => Err(format!("{e:#}")),
++                }),
+                 Job::Unlock { closed, user, credential } => {
+                     Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
+                 }
+--- a/crates/skyward/src/input.rs
++++ b/crates/skyward/src/input.rs
+@@ -89,14 +89,28 @@
+         let mut x_range = None;
+         let mut y_range = None;
+         let mut slots = 1;
++        // The kernel gives a panel's reach in one of two shapes: the
++        // multitouch axes, or the single-touch ABS_X/ABS_Y pair that some
++        // vendor drivers leave a multitouch panel with as well. Either is
++        // read, the multitouch one first.
++        let mut single_x = None;
++        let mut single_y = None;
+         for (axis, info) in dev.get_absinfo().context("read touch axis ranges")? {
+             match axis {
+                 AbsoluteAxisCode::ABS_MT_POSITION_X => x_range = Some((info.minimum(), info.maximum())),
+                 AbsoluteAxisCode::ABS_MT_POSITION_Y => y_range = Some((info.minimum(), info.maximum())),
++                AbsoluteAxisCode::ABS_X => single_x = Some((info.minimum(), info.maximum())),
++                AbsoluteAxisCode::ABS_Y => single_y = Some((info.minimum(), info.maximum())),
+                 AbsoluteAxisCode::ABS_MT_SLOT => slots = info.maximum() as usize + 1,
+                 _ => {}
+             }
+         }
++        let (x_range, y_range) = match (x_range, y_range) {
++            (Some(x), Some(y)) => (Some(x), Some(y)),
++            _ => (single_x, single_y),
++        };
++        let mut x_range = x_range;
++        let mut y_range = y_range;
+         let x_range = x_range.ok_or_else(|| anyhow!("touch panel reports no X range"))?;
+         let y_range = y_range.ok_or_else(|| anyhow!("touch panel reports no Y range"))?;
+         // Stamp events with the clock the UI keeps time by: how fast a
+@@ -169,6 +183,18 @@
+                     self.raw.1 = v;
+                     self.moved = true;
+                 }
++                // A panel that reports only the single-touch pair says where
++                // the finger is the same way; its press is BTN_TOUCH.
++                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, v) => {
++                    self.raw.0 = v;
++                    self.moved = true;
++                }
++                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, v) => {
++                    self.raw.1 = v;
++                    self.moved = true;
++                }
++                EventSummary::Key(_, KeyCode::BTN_TOUCH, 0) => self.down = false,
++                EventSummary::Key(_, KeyCode::BTN_TOUCH, _) => self.down = true,
+                 _ => {}
+             }
+         }
+@@ -235,12 +261,33 @@
+                 continue;
+             }
+             let direct = dev.properties().contains(PropType::DIRECT);
++            let pointer = dev.properties().contains(PropType::POINTER);
+             let mt = dev
+                 .supported_absolute_axes()
+                 .is_some_and(|a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y));
++            let single = dev.supported_absolute_axes().is_some_and(|a| {
++                a.contains(AbsoluteAxisCode::ABS_X) && a.contains(AbsoluteAxisCode::ABS_Y)
++            });
+             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
+-            eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
+-            if direct && mt && self.panel.is_none() {
++            // Say what every device under /dev/input is, to the kernel log as
++            // well as the recovery's own: a build of a phone whose panel the
++            // recovery does not take in can be told apart from one that has
++            // no panel at all only by what was here.
++            let said = format!(
++                "input {}: {:?} direct={direct} pointer={pointer} multitouch={mt} single={single} keys={keys}",
++                path.display(),
++                dev.name().unwrap_or("?")
++            );
++            eprintln!("{said}");
++            let _ = skyward_sys::kmsg(&said);
++            // A touch panel is a device that reports where a finger is, in
++            // either of the two shapes the kernel gives that: absolute
++            // multitouch axes, or the single-touch ABS_X/ABS_Y pair. The
++            // DIRECT property says the panel lies over the display, and
++            // some vendor drivers leave it off, so it is preferred but not
++            // required; a device that merely has keys is never taken.
++            let is_panel = (mt || single) && !keys;
++            if is_panel && self.panel.is_none() {
+                 self.wakeful.add(dev.as_raw_fd())?;
+                 self.panel = Some(Panel::new(path, dev)?);
+                 for w in &self.touch_writes {
