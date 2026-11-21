@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       stock_url:
-        description: "stock recovery 直链，留空则从本仓 Release tag stock-mondrian 下"
+        description: "stock recovery direct link; empty = from this repo release stock-mondrian"
         required: false
         default: ""
   push:
@@ -12,6 +12,7 @@ on:
     paths:
       - "devices/mondrian.toml"
       - ".github/workflows/build-mondrian.yml"
+      - "scripts/**"
 
 permissions:
   contents: write
@@ -25,12 +26,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
-      - name: 取本仓（拿 toml 与 workflow）
+      - name: checkout
         uses: actions/checkout@v4
         with:
           path: cfg
 
-      - name: 系统依赖
+      - name: system deps
         run: |
           set -e
           sudo apt-get update -y
@@ -39,7 +40,7 @@ jobs:
             lz4 liblz4-tool cpio zstd xz-utils \
             zip unzip curl wget python3 file
 
-      - name: 拉上游源码
+      - name: fetch upstream
         run: |
           set -e
           curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
@@ -50,19 +51,19 @@ jobs:
           ls src | head
           grep -m1 channel src/rust-toolchain.toml
 
-      - name: 合入 mondrian 配置
+      - name: apply mondrian config
         run: |
           set -e
           cp cfg/devices/mondrian.toml src/devices/mondrian.toml
           ls -l src/devices/mondrian.toml
 
-      - name: Rust
+      - name: rust
         run: |
           set -e
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: NDK r29
+      - name: ndk r29
         run: |
           set -e
           NDK=android-ndk-r29-linux.zip
@@ -74,7 +75,7 @@ jobs:
             echo "try $U"
             if curl -fL --retry 3 --connect-timeout 30 -o /tmp/ndk.zip "$U"; then ok=1; break; fi
           done
-          [ "$ok" = "1" ] || { echo "NDK 下载失败"; exit 1; }
+          [ "$ok" = "1" ] || { echo "ndk download failed"; exit 1; }
           sudo mkdir -p /opt/ndk
           sudo unzip -q /tmp/ndk.zip -d /opt/ndk
           sudo mv /opt/ndk/android-ndk-r29 /opt/ndk/r29
@@ -83,7 +84,7 @@ jobs:
           echo "ANDROID_NDK_ROOT=/opt/ndk/r29" >> $GITHUB_ENV
           echo "/opt/ndk/r29/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-      - name: 工具链
+      - name: toolchain
         working-directory: src
         run: |
           set -e
@@ -94,7 +95,7 @@ jobs:
           rustup target add aarch64-linux-android
           cargo install cargo-ndk --locked
 
-      - name: 取 stock recovery
+      - name: fetch stock recovery
         run: |
           set -e
           mkdir -p src/target/stock/mondrian
@@ -108,7 +109,18 @@ jobs:
           ls -l "$OUT"
           sha256sum "$OUT"
 
-      - name: 编译
+      - name: recut stock ramdisk
+        working-directory: src
+        run: |
+          set -e
+          cp "$GITHUB_WORKSPACE/cfg/scripts/prep_stock.py" /tmp/prep_stock.py
+          python3 /tmp/prep_stock.py \
+            target/stock/mondrian/recovery.img \
+            target/stock/mondrian/recovery_fixed.img
+          ls -l target/stock/mondrian/
+          ls -l -h target/stock/mondrian/recovery_fixed.img
+
+      - name: build
         working-directory: src
         run: |
           set -e
@@ -118,13 +130,13 @@ jobs:
             cargo ndk -t arm64-v8a --platform 30 build --release \
             -p skyward-system-init --target-dir target/system-init
 
-      - name: 打包
+      - name: pack
         working-directory: src
         run: |
           set -e
           OUT="skyward-mondrian-$(date +%Y%m%d)-${{ github.run_number }}.img"
           target/release/skyward-pack recovery \
-            --stock target/stock/mondrian/recovery.img \
+            --stock target/stock/mondrian/recovery_fixed.img \
             --binary target/aarch64-linux-android/release/skyward \
             --system-init target/system-init/aarch64-linux-android/release/system-init \
             --config devices/mondrian.toml \
@@ -137,7 +149,7 @@ jobs:
           cat "$OUT.sha256"
           cp "$OUT" "$OUT.sha256" "$GITHUB_WORKSPACE/cfg/"
 
-      - name: 上传 artifact
+      - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: skyward-mondrian
@@ -146,15 +158,15 @@ jobs:
             cfg/skyward-mondrian-*.img.sha256
           retention-days: 30
 
-      - name: 发 Release
+      - name: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: mondrian-${{ github.run_number }}
           name: "Skyward for Redmi K60 (mondrian) build ${{ github.run_number }}"
           body: |
             Redmi K60 / mondrian / SM8475 (taro) / Android 16
-            stock 基底：设备自身导出的 recovery_a
-            刷入：
+            stock base: device own recovery_a, ramdisk recut to 4 MiB LZ4 legs
+            flash:
             fastboot flash recovery skyward-mondrian-*.img
             fastboot reboot recovery
           files: |
