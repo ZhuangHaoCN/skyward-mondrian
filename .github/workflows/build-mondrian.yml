@@ -1,0 +1,162 @@
+name: build-mondrian
+
+on:
+  workflow_dispatch:
+    inputs:
+      stock_url:
+        description: "stock recovery 直链，留空则从本仓 Release tag stock-mondrian 下"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+    paths:
+      - "devices/mondrian.toml"
+      - ".github/workflows/build-mondrian.yml"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: kirklin/skyward
+  UPSTREAM_SHA: c5e09f6eb644e75e051b309f98d6745ccbc97d81
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: 取本仓（拿 toml 与 workflow）
+        uses: actions/checkout@v4
+        with:
+          path: cfg
+
+      - name: 系统依赖
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm pkg-config \
+            lz4 liblz4-tool cpio zstd xz-utils \
+            zip unzip curl wget python3 file
+
+      - name: 拉上游源码
+        run: |
+          set -e
+          curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -o /tmp/up.tar.gz \
+            "https://api.github.com/repos/${UPSTREAM}/tarball/${UPSTREAM_SHA}"
+          mkdir -p src
+          tar -xzf /tmp/up.tar.gz -C src --strip-components=1
+          ls src | head
+          grep -m1 channel src/rust-toolchain.toml
+
+      - name: 合入 mondrian 配置
+        run: |
+          set -e
+          cp cfg/devices/mondrian.toml src/devices/mondrian.toml
+          ls -l src/devices/mondrian.toml
+
+      - name: Rust
+        run: |
+          set -e
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: NDK r29
+        run: |
+          set -e
+          NDK=android-ndk-r29-linux.zip
+          ok=0
+          for U in \
+            "https://dl.google.com/android/repository/$NDK" \
+            "https://mirrors.cloud.tencent.com/AndroidSDK/$NDK" \
+            "https://mirrors.aliyun.com/android.googlesource.com/$NDK" ; do
+            echo "try $U"
+            if curl -fL --retry 3 --connect-timeout 30 -o /tmp/ndk.zip "$U"; then ok=1; break; fi
+          done
+          [ "$ok" = "1" ] || { echo "NDK 下载失败"; exit 1; }
+          sudo mkdir -p /opt/ndk
+          sudo unzip -q /tmp/ndk.zip -d /opt/ndk
+          sudo mv /opt/ndk/android-ndk-r29 /opt/ndk/r29
+          test -d /opt/ndk/r29
+          echo "ANDROID_NDK_HOME=/opt/ndk/r29" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=/opt/ndk/r29" >> $GITHUB_ENV
+          echo "/opt/ndk/r29/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: 工具链
+        working-directory: src
+        run: |
+          set -e
+          TC=$(grep -E '^channel' rust-toolchain.toml | head -1 | sed 's/.*=//' | tr -d ' "')
+          echo "toolchain=$TC"
+          rustup toolchain install "$TC" --profile minimal
+          rustup default "$TC"
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: 取 stock recovery
+        run: |
+          set -e
+          mkdir -p src/target/stock/mondrian
+          OUT=src/target/stock/mondrian/recovery.img
+          if [ -n "${{ inputs.stock_url }}" ]; then
+            curl -fL --retry 3 -o "$OUT" "${{ inputs.stock_url }}"
+          else
+            curl -fL --retry 3 -o "$OUT" \
+              "https://github.com/${{ github.repository }}/releases/download/stock-mondrian/stock_recovery_a.img"
+          fi
+          ls -l "$OUT"
+          sha256sum "$OUT"
+
+      - name: 编译
+        working-directory: src
+        run: |
+          set -e
+          cargo ndk -t arm64-v8a --platform 30 build --release -p skyward
+          cargo build --release -p skyward-pack
+          RUSTFLAGS="-C target-feature=+crt-static" \
+            cargo ndk -t arm64-v8a --platform 30 build --release \
+            -p skyward-system-init --target-dir target/system-init
+
+      - name: 打包
+        working-directory: src
+        run: |
+          set -e
+          OUT="skyward-mondrian-$(date +%Y%m%d)-${{ github.run_number }}.img"
+          target/release/skyward-pack recovery \
+            --stock target/stock/mondrian/recovery.img \
+            --binary target/aarch64-linux-android/release/skyward \
+            --system-init target/system-init/aarch64-linux-android/release/system-init \
+            --config devices/mondrian.toml \
+            --font resources/fonts/MiSansVF.ttf \
+            --mono resources/fonts/KirkMono-Regular.ttf \
+            --mono-license resources/fonts/KirkMono-OFL.txt \
+            --out "$OUT"
+          ls -l "$OUT"
+          sha256sum "$OUT" > "$OUT.sha256"
+          cat "$OUT.sha256"
+          cp "$OUT" "$OUT.sha256" "$GITHUB_WORKSPACE/cfg/"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyward-mondrian
+          path: |
+            cfg/skyward-mondrian-*.img
+            cfg/skyward-mondrian-*.img.sha256
+          retention-days: 30
+
+      - name: 发 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mondrian-${{ github.run_number }}
+          name: "Skyward for Redmi K60 (mondrian) build ${{ github.run_number }}"
+          body: |
+            Redmi K60 / mondrian / SM8475 (taro) / Android 16
+            stock 基底：设备自身导出的 recovery_a
+            刷入：
+            fastboot flash recovery skyward-mondrian-*.img
+            fastboot reboot recovery
+          files: |
+            cfg/skyward-*.img
+            cfg/skyward-*.img.sha256
