@@ -13,9 +13,21 @@ density = 560
 diagonal = 6.67
 corner_radius = 120
 
+# The touch driver is carried in the vendor_boot ramdisk, and the recovery
+# loads it from there: the phone's vendor partition is a logical one that
+# nothing maps in the recovery, so it is kept out of the table here. The
+# copies in the ramdisk are the phone's own, put there by this tree's own
+# tools from the vendor partition it shipped on, so that goodix_core loads
+# with the driver that reads the touch-expert-array and the panel-max fields
+# its node in the device tree holds.
 [modules]
-sources = ["vendor_boot", "vendor_dlkm", "vendor"]
-load = ["panel_event_notifier", "xiaomi_touch", "goodix_core", "goodix_fod", "goodix_health"]
+sources = ["vendor_boot"]
+# Only what the ramdisk holds: the list is walked in order and the first
+# file not found stops the whole load, so a name that is not there takes
+# every module after it down with it. xiaomi_touch is on the phone's vendor
+# partition, which nothing maps in the recovery, and goodix_core in the
+# ramdisk is the build that does not need it.
+load = ["panel_event_notifier", "goodix_core", "goodix_fod", "goodix_health"]
 
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
