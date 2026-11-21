@@ -57,6 +57,69 @@ def encode_legacy(raw, leg):
         blocks += 1
     return bytes(out), blocks, biggest
 
+
+def cpio_entries(blob):
+    """Walk a newc archive and yield (name, mode, uid, gid, mtime, nlink,
+    dev, rdev, data) for each member, reading only what it needs."""
+    pos = 0
+    while pos + 110 <= len(blob):
+        if blob[pos:pos + 6] != b'070701':
+            return
+        def field(offset):
+            return int(blob[pos + offset:pos + offset + 8], 16)
+        mode = field(14)
+        uid = field(22)
+        gid = field(30)
+        nlink = field(38)
+        mtime = field(46)
+        filesize = field(54)
+        dev_major = field(62)
+        dev_minor = field(70)
+        rdev_major = field(78)
+        rdev_minor = field(86)
+        namesize = field(94)
+        name = blob[pos + 110:pos + 110 + namesize - 1].decode('utf-8', 'replace')
+        pos += 110 + namesize
+        pos = (pos + 3) & ~3
+        data = blob[pos:pos + filesize]
+        pos += filesize
+        pos = (pos + 3) & ~3
+        if name == 'TRAILER!!!':
+            return
+        yield (name, mode, uid, gid, mtime, nlink,
+               (dev_major, dev_minor), (rdev_major, rdev_minor), data)
+
+
+def cpio_build(entries):
+    out = bytearray()
+    ino = 300000
+    for (name, mode, uid, gid, mtime, nlink, dev, rdev, data) in entries:
+        raw = name.encode() + b'\x00'
+        header = b'070701'
+        for value in (ino, mode, uid, gid, nlink, mtime, len(data),
+                      dev[0], dev[1], rdev[0], rdev[1], len(raw), 0):
+            header += b'%08x' % value
+        out += header
+        out += raw
+        out += b'\x00' * ((-(110 + len(raw))) % 4)
+        out += data
+        out += b'\x00' * ((-len(data)) % 4)
+        ino += 1
+    trailer = b'TRAILER!!!\x00'
+    header = b'070701' + b'%08x' % ino
+    for _ in range(11):
+        header += b'00000000'
+    header += b'%08x' % len(trailer) + b'00000000'
+    out += header + trailer
+    out += b'\x00' * ((-(110 + len(trailer))) % 4)
+    return bytes(out)
+
+
+# Third-party trees a phone maker never ships: TWRP keeps its fonts and
+# images in twres, and this recovery also carries Magisk's install apks. Both
+# go, so the ramdisk holds only what MIUI put there.
+DROP_PREFIXES = ('twres', 'FFiles', 'customzip', 'magisk_prebuilt')
+
 def main(argv):
     if len(argv) < 3:
         sys.exit('usage: prep_stock.py <stock.img> <out.img>')
@@ -69,6 +132,21 @@ def main(argv):
     print('page0 header, ramdisk_size =', ramdisk_size)
     raw = decode_legacy(data[page:page + ramdisk_size])
     print('payload =', len(raw), 'bytes')
+
+    kept = []
+    dropped = []
+    for entry in cpio_entries(raw):
+        if entry[0].startswith(DROP_PREFIXES):
+            dropped.append(entry)
+        else:
+            kept.append(entry)
+    if dropped:
+        print('dropping %d entries, %d bytes (third-party trees)'
+              % (len(dropped), sum(len(e[8]) for e in dropped)))
+        for entry in dropped[:8]:
+            print('   -', entry[0])
+    raw = cpio_build(kept)
+    print('filtered payload =', len(raw), 'bytes, %d entries' % len(kept))
 
     chosen = None
     for leg in (4 << 20, 2 << 20, 1 << 20):
