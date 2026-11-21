@@ -15,7 +15,7 @@ corner_radius = 120
 
 [modules]
 sources = ["vendor_boot", "vendor_dlkm", "vendor"]
-load = ["goodix_core", "goodix_fod", "goodix_health", "xiaomi_touch"]
+load = ["panel_event_notifier", "xiaomi_touch", "goodix_core", "goodix_fod", "goodix_health"]
 
 [touch]
 writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]

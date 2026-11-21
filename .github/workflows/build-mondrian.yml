@@ -13,6 +13,7 @@ on:
       - "devices/mondrian.toml"
       - ".github/workflows/build-mondrian.yml"
       - "scripts/**"
+      - "patches/**"
 
 permissions:
   contents: write
@@ -56,6 +57,19 @@ jobs:
           set -e
           cp cfg/devices/mondrian.toml src/devices/mondrian.toml
           ls -l src/devices/mondrian.toml
+
+      - name: apply patches
+        run: |
+          set -e
+          if [ -d cfg/patches ] && [ -n "$(ls -A cfg/patches/*.patch 2>/dev/null)" ]; then
+            for P in cfg/patches/*.patch; do
+              echo "applying $P"
+              patch -p1 -d src --forward --batch < "$P"
+            done
+          else
+            echo "no patches"
+          fi
+          grep -n 'encrypted_whole' src/crates/skyward-crypto/src/data.rs || true
 
       - name: rust
         run: |
