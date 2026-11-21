@@ -60,23 +60,22 @@ def encode_legacy(raw, leg):
 
 def cpio_entries(blob):
     """Walk a newc archive and yield (name, mode, uid, gid, mtime, nlink,
-    dev, rdev, data) for each member, reading only what it needs."""
+    dev, rdev, data) for each member."""
     pos = 0
     while pos + 110 <= len(blob):
         if blob[pos:pos + 6] != b'070701':
             return
         def field(offset):
             return int(blob[pos + offset:pos + offset + 8], 16)
+        ino = field(6)
         mode = field(14)
         uid = field(22)
         gid = field(30)
         nlink = field(38)
         mtime = field(46)
         filesize = field(54)
-        dev_major = field(62)
-        dev_minor = field(70)
-        rdev_major = field(78)
-        rdev_minor = field(86)
+        dev = (field(62), field(70))
+        rdev = (field(78), field(86))
         namesize = field(94)
         name = blob[pos + 110:pos + 110 + namesize - 1].decode('utf-8', 'replace')
         pos += 110 + namesize
@@ -86,32 +85,30 @@ def cpio_entries(blob):
         pos = (pos + 3) & ~3
         if name == 'TRAILER!!!':
             return
-        yield (name, mode, uid, gid, mtime, nlink,
-               (dev_major, dev_minor), (rdev_major, rdev_minor), data)
+        yield (name, ino, mode, uid, gid, nlink, mtime, dev, rdev, data)
+
+
+def cpio_header(name, ino, mode, uid, gid, nlink, mtime, filesize, dev, rdev):
+    raw_name = name.encode() + b'\x00'
+    fields = [ino, mode, uid, gid, nlink, mtime, filesize,
+              dev[0], dev[1], rdev[0], rdev[1], len(raw_name), 0]
+    header = b'070701' + b''.join(b'%08x' % (f & 0xFFFFFFFF) for f in fields)
+    assert len(header) == 110, len(header)
+    return header, raw_name
 
 
 def cpio_build(entries):
     out = bytearray()
-    ino = 300000
-    for (name, mode, uid, gid, mtime, nlink, dev, rdev, data) in entries:
-        raw = name.encode() + b'\x00'
-        header = b'070701'
-        for value in (ino, mode, uid, gid, nlink, mtime, len(data),
-                      dev[0], dev[1], rdev[0], rdev[1], len(raw), 0):
-            header += b'%08x' % value
-        out += header
-        out += raw
-        out += b'\x00' * ((-(110 + len(raw))) % 4)
+    for (name, ino, mode, uid, gid, nlink, mtime, dev, rdev, data) in entries:
+        header, raw_name = cpio_header(name, ino, mode, uid, gid, nlink, mtime,
+                                      len(data), dev, rdev)
+        out += header + raw_name
+        out += b'\x00' * ((-(110 + len(raw_name))) % 4)
         out += data
         out += b'\x00' * ((-len(data)) % 4)
-        ino += 1
-    trailer = b'TRAILER!!!\x00'
-    header = b'070701' + b'%08x' % ino
-    for _ in range(11):
-        header += b'00000000'
-    header += b'%08x' % len(trailer) + b'00000000'
-    out += header + trailer
-    out += b'\x00' * ((-(110 + len(trailer))) % 4)
+    header, raw_name = cpio_header('TRAILER!!!', 0, 0, 0, 0, 1, 0, 0, (0, 0), (0, 0))
+    out += header + raw_name
+    out += b'\x00' * ((-(110 + len(raw_name))) % 4)
     return bytes(out)
 
 
@@ -142,7 +139,7 @@ def main(argv):
             kept.append(entry)
     if dropped:
         print('dropping %d entries, %d bytes (third-party trees)'
-              % (len(dropped), sum(len(e[8]) for e in dropped)))
+              % (len(dropped), sum(len(e[9]) for e in dropped)))
         for entry in dropped[:8]:
             print('   -', entry[0])
     raw = cpio_build(kept)
