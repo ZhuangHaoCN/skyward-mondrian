@@ -1,60 +1,95 @@
 #!/usr/bin/env python3
-"""Recut a bootimg v3 ramdisk into legs whose LZ4 blocks stay under 8 MiB."""
-import struct, subprocess, os, sys
+"""Recut a bootimg v3 ramdisk so every LZ4 legacy block stays under 8 MiB.
 
-MAX_BLOCK = 8388608
+lz4 -l ignores -B, so the legs are framed here: magic, then each 4 MiB of
+payload as one lz4 block with its compressed length in front. lz4_flex, the
+decoder skyward-bootimg uses, refuses any block over 8 MiB, which is exactly
+what a stock ramdisk carrying pregzipped payloads (Magisk's two 11.7 MB apks)
+produces at the default 8 MiB leg.
+"""
+import struct, sys
+
+try:
+    import lz4.block
+except ImportError:
+    sys.exit('need the lz4 python module: pip install lz4')
+
+LEGACY_MAGIC = b'\x02\x21\x4c\x18'
+MAX_BLOCK = 8 * 1024 * 1024
+
+def decode_legacy(rd):
+    out = bytearray()
+    pos = 0
+    first = True
+    while pos + 4 <= len(rd):
+        if first and rd[:4] == LEGACY_MAGIC:
+            pos = 4
+        first = False
+        if pos + 4 > len(rd):
+            break
+        size = struct.unpack('<I', rd[pos:pos + 4])[0]
+        pos += 4
+        if size == 0 or size > len(rd) - pos:
+            break
+        chunk = rd[pos:pos + size]
+        pos += size
+        dec = None
+        for guess in (8 << 20, 16 << 20, 32 << 20, 64 << 20):
+            try:
+                dec = lz4.block.decompress(chunk, uncompressed_size=guess)
+                break
+            except Exception:
+                continue
+        if dec is None:
+            sys.exit('could not decompress a block near offset %d' % (pos - size))
+        out += dec
+    return bytes(out)
+
+def encode_legacy(raw, leg):
+    out = bytearray(LEGACY_MAGIC)
+    biggest = 0
+    blocks = 0
+    for start in range(0, len(raw), leg):
+        packed = lz4.block.compress(raw[start:start + leg], store_size=False)
+        out += struct.pack('<I', len(packed))
+        out += packed
+        biggest = max(biggest, len(packed))
+        blocks += 1
+    return bytes(out), blocks, biggest
 
 def main(argv):
+    if len(argv) < 3:
+        sys.exit('usage: prep_stock.py <stock.img> <out.img>')
     src, dst = argv[1], argv[2]
-    d = open(src, 'rb').read()
-    if d[:8] != b'ANDROID!':
+    data = open(src, 'rb').read()
+    if data[:8] != b'ANDROID!':
         sys.exit('not a boot image: ' + src)
-    rs = struct.unpack('<I', d[12:16])[0]
+    ramdisk_size = struct.unpack('<I', data[12:16])[0]
     page = 4096
-    rd = d[page:page + rs]
-    print('page0 header, ramdisk_size =', rs)
+    print('page0 header, ramdisk_size =', ramdisk_size)
+    raw = decode_legacy(data[page:page + ramdisk_size])
+    print('payload =', len(raw), 'bytes')
 
-    open('/tmp/rd_in.lz4', 'wb').write(rd)
-    with open('/tmp/rd.cpio', 'wb') as f:
-        subprocess.run(['lz4', '-l', '-d', '-c', '/tmp/rd_in.lz4'], stdout=f, check=True)
-    cpio_size = os.path.getsize('/tmp/rd.cpio')
-    print('cpio size =', cpio_size)
-
-    best = None
-    for blk in ('-B4', '-B2', '-B1'):
-        with open('/tmp/rd_out.lz4', 'wb') as f:
-            subprocess.run(['lz4', '-l', blk, '-9', '-c', '/tmp/rd.cpio'], stdout=f, check=True)
-        size = os.path.getsize('/tmp/rd_out.lz4')
-        ok, biggest = check_blocks('/tmp/rd_out.lz4', MAX_BLOCK)
-        print('  %s -> %d bytes, max block %d, ok=%s' % (blk, size, biggest, ok))
-        if ok:
-            best = size
+    chosen = None
+    for leg in (4 << 20, 2 << 20, 1 << 20):
+        packed, blocks, biggest = encode_legacy(raw, leg)
+        print('  leg %2d MiB -> %d blocks, %d bytes, biggest block %d, fits=%s'
+              % (leg >> 20, blocks, len(packed), biggest, biggest <= MAX_BLOCK))
+        if biggest <= MAX_BLOCK:
+            chosen = packed
             break
-    if best is None:
-        sys.exit('no block size kept every leg under 8 MiB')
+    if chosen is None:
+        sys.exit('no leg size keeps every block under 8 MiB')
 
-    head = bytearray(d[:page])
-    struct.pack_into('<I', head, 12, best)
-    new = bytes(head) + open('/tmp/rd_out.lz4', 'rb').read()
-    if len(new) < len(d):
-        new += b'\x00' * (len(d) - len(new))
-    elif len(new) > len(d):
-        sys.exit('recut image is larger than the partition: %d > %d' % (len(new), len(d)))
-    open(dst, 'wb').write(new)
-    print('written', dst, len(new))
-
-def check_blocks(path, limit):
-    rd = open(path, 'rb').read()
-    pos = 4 if rd[:4] == b'\x02\x21\x4c\x18' else 0
-    biggest = 0
-    while pos + 4 <= len(rd):
-        sz = struct.unpack('<I', rd[pos:pos + 4])[0]
-        pos += 4
-        if sz == 0 or sz > len(rd) - pos:
-            break
-        biggest = max(biggest, sz)
-        pos += sz
-    return biggest <= limit, biggest
+    head = bytearray(data[:page])
+    struct.pack_into('<I', head, 12, len(chosen))
+    image = bytes(head) + chosen
+    if len(image) > len(data):
+        sys.exit('recut image %d exceeds the partition %d' % (len(image), len(data)))
+    image += b'\x00' * (len(data) - len(image))
+    open(dst, 'wb').write(image)
+    print('written', dst, len(image))
+    print('new ramdisk_size =', len(chosen))
 
 if __name__ == '__main__':
     main(sys.argv)
