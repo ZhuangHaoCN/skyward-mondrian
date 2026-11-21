@@ -117,6 +117,18 @@ def cpio_build(entries):
 # go, so the ramdisk holds only what MIUI put there.
 DROP_PREFIXES = ('twres', 'FFiles', 'customzip', 'magisk_prebuilt')
 
+# The commands skyward-pack points at its own binary, one link each. A stock
+# recovery that a third party shipped carries some of them as real binaries,
+# and a link cannot be made over a file: those are removed here, so pack adds
+# the links itself.
+SKYWARD_COMMANDS = (
+    'system/bin/7za',
+    'system/bin/avbctl',
+    'system/bin/resetprop',
+    'system/bin/unzip',
+    'system/bin/zstd',
+)
+
 def main(argv):
     if len(argv) < 3:
         sys.exit('usage: prep_stock.py <stock.img> <out.img>')
@@ -133,7 +145,11 @@ def main(argv):
     kept = []
     dropped = []
     for entry in cpio_entries(raw):
-        if entry[0].startswith(DROP_PREFIXES):
+        name, _ino, mode = entry[0], entry[1], entry[2]
+        is_link = (mode & 0o170000) == 0o120000
+        if name.startswith(DROP_PREFIXES):
+            dropped.append(entry)
+        elif name in SKYWARD_COMMANDS and not is_link:
             dropped.append(entry)
         else:
             kept.append(entry)
